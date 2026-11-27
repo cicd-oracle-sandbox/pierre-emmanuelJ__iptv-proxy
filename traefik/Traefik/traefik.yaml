@@ -1,0 +1,33 @@
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  filePath: /var/log/traefik/traefik.log
+  level: INFO
+
+accessLog:
+  filePath: /var/log/traefik/access.log
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: ACME@EMAIL.COM # your e-mail address
+      storage: /etc/traefik/acme.json
+      tlsChallenge: {}
+
+providers:
+  docker:
+    endpoint: unix:///var/run/docker.sock
+    exposedByDefault: false

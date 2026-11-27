@@ -1,0 +1,4 @@
+upstream: https://github.com/pierre-emmanuelJ/iptv-proxy
+commit: 7f93cc2721843382035bc18784e6635498c9ee6d
+license: GPL-3.0
+Unmodified snapshot except that .github/workflows was emptied.

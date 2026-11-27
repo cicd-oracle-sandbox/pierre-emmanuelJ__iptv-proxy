@@ -1,0 +1,465 @@
+/*
+ * Iptv-Proxy is a project to proxyfie an m3u file and to proxyfie an Xtream iptv service (client API).
+ * Copyright (C) 2020  Pierre-Emmanuel Jacquier
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+package server
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+
+	"github.com/pierre-emmanuelJ/iptv-proxy/pkg/config"
+	"github.com/pierre-emmanuelJ/iptv-proxy/pkg/filter"
+	"github.com/pierre-emmanuelJ/iptv-proxy/pkg/hls"
+	"github.com/pierre-emmanuelJ/iptv-proxy/pkg/m3u"
+	"github.com/pierre-emmanuelJ/iptv-proxy/pkg/restream"
+	"github.com/pierre-emmanuelJ/iptv-proxy/pkg/xtream"
+)
+
+const (
+	// defaultUserAgent is used when the proxy talks to a provider on its own
+	// (no client request to take one from). Providers commonly refuse Go's.
+	defaultUserAgent = "VLC/3.0.20 LibVLC/3.0.20"
+
+	playlistFetchTimeout = 2 * time.Minute
+	connectTimeout       = 15 * time.Second
+)
+
+// How long a provider has to start answering. A stream starts at once or
+// not at all; a whole playlist or guide is generated on request, which can
+// take minutes with a large catalogue. Once it answers, a response lasts as
+// long as it has to.
+var (
+	streamHeaderTimeout = 30 * time.Second
+	apiHeaderTimeout    = 5 * time.Minute
+)
+
+// streamRetries are the waits before each attempt to open again a live
+// stream the provider dropped while clients are watching it.
+var streamRetries = []time.Duration{0, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second}
+
+// Config represent the server configuration
+type Config struct {
+	*config.ProxyConfig
+
+	// m3u is the provider's M3U playlist, in M3U mode.
+	m3u m3uPlaylist
+
+	endpointAntiColision string
+
+	// client is for streams, apiClient for the provider's API, playlists
+	// and guide. Both follow redirects.
+	client    *http.Client
+	apiClient *http.Client
+
+	// tokens name the addresses found in HLS playlists.
+	tokens *addressTokens
+
+	// hub shares one provider connection between the clients of a live
+	// stream.
+	hub *restream.Hub
+
+	m3uCacheLock sync.Mutex
+	m3uCache     map[string]cachedM3U
+
+	// rules keep the channels clients see; nil keeps them all. tunerRules
+	// keep the HDHomeRun tuner's.
+	rules      *filter.Rules
+	tunerRules *filter.Rules
+	groups     liveGroups
+
+	// lastGood answers for a provider that fails.
+	lastGood *lastGood
+
+	// tuner is the HDHomeRun tuner's state.
+	tuner tuner
+	// ffmpeg is the path of the ffmpeg the tuner remuxes HLS with, or "";
+	// ffmpegWait how long it may take to give its first bytes.
+	ffmpeg     string
+	ffmpegWait time.Duration
+
+	// users are the proxy's users, the first one first.
+	users       []*proxyUser
+	usersByName map[string]*proxyUser
+	// passthrough are the provider accounts clients logged in with, in
+	// passthrough mode.
+	passthrough passthrough
+
+	// sources are the Xtream accounts served as one catalogue, when there
+	// are several; merge is what the proxy keeps of that catalogue.
+	sources []*source
+	merge   merging
+	// liveAccess are the live streams users with filters may watch.
+	liveAccess liveAccess
+}
+
+type cachedM3U struct {
+	body []byte
+	at   time.Time
+}
+
+// NewServer initialize a new server configuration
+func NewServer(config *config.ProxyConfig) (*Config, error) {
+	newTransport := func(headerTimeout time.Duration, compression bool) *http.Transport {
+		return &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   connectTimeout,
+			ResponseHeaderTimeout: headerTimeout,
+			MaxIdleConnsPerHost:   16,
+			IdleConnTimeout:       90 * time.Second,
+			DisableCompression:    !compression,
+		}
+	}
+
+	c := &Config{
+		ProxyConfig:          config,
+		endpointAntiColision: strings.Trim(config.CustomId, "/"),
+		// Media is passed on as the provider sends it.
+		client: &http.Client{Transport: newTransport(streamHeaderTimeout, false)},
+		// API answers, playlists and guides are read by the proxy: they are
+		// asked compressed and read uncompressed, and some providers
+		// compress them whatever the request asks.
+		apiClient: &http.Client{Transport: newTransport(apiHeaderTimeout, true)},
+		m3uCache:  map[string]cachedM3U{},
+		lastGood:  newLastGood(),
+	}
+	remote := ""
+	if config.RemoteURL != nil {
+		remote = config.RemoteURL.String()
+	}
+
+	var err error
+	if c.rules, err = filter.New(config.Filter); err != nil {
+		return nil, err
+	}
+	tuner, err := filter.New(config.HDHomeRunFilter)
+	if err != nil {
+		return nil, fmt.Errorf("the HDHomeRun tuner's filters: %w", err)
+	}
+	c.tunerRules = filter.Combine(c.rules, tuner)
+	if err := c.setupFFmpeg(); err != nil {
+		return nil, err
+	}
+	if err := c.setupSources(); err != nil {
+		return nil, err
+	}
+	if err := c.setupUsers(); err != nil {
+		return nil, err
+	}
+	if c.XtreamPassthrough {
+		// Nothing in the settings is secret: tokens are good for this run.
+		secret := make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			return nil, err
+		}
+		if c.tokens, err = newAddressTokens(string(secret)); err != nil {
+			return nil, err
+		}
+		c.hub = newHub()
+		return c, nil
+	}
+
+	// Tokens and track addresses derive from the first user's credentials:
+	// with a single user, they stay what they were.
+	first := c.users[0]
+	if c.tokens, err = newAddressTokens(first.name.String(), first.password.String(), config.XtreamUser.String(), config.XtreamPassword.String(), config.XtreamBaseURL, remote); err != nil {
+		return nil, err
+	}
+
+	c.hub = newHub()
+
+	if c.endpointAntiColision == "" {
+		// The same settings give the same track addresses, restart after
+		// restart.
+		sum := sha256.Sum256([]byte("iptv-proxy track prefix\x00" + first.name.String() + "\x00" + first.password.String() + "\x00" + remote))
+		c.endpointAntiColision = hex.EncodeToString(sum[:4])
+	}
+
+	// With an Xtream provider the playlist is asked for when a client wants
+	// it: nothing to download before starting.
+	if c.servesM3U() {
+		if err := c.loadM3U(context.Background()); err != nil {
+			return nil, err
+		}
+	}
+
+	return c, nil
+}
+
+// newHub shares the provider connections of live streams.
+func newHub() *restream.Hub {
+	hub := restream.NewHub()
+	hub.Retries = streamRetries
+	hub.Shareable = func(resp *http.Response, begin []byte) bool {
+		// A live stream has no end, hence no length. A playlist is rewritten
+		// for each client; an error is that client's to read.
+		return resp.StatusCode == http.StatusOK && resp.ContentLength < 0 && !hls.IsPlaylist(begin)
+	}
+	return hub
+}
+
+// Handler is the proxy's HTTP API.
+func (c *Config) Handler() http.Handler {
+	router := gin.New()
+	router.Use(gin.LoggerWithFormatter(c.accessLog), gin.Recovery(), cors.Default())
+	c.routes(router.Group("/"))
+	return router
+}
+
+// accessLog writes a request the way gin does, with the proxy's credentials
+// masked: they sit in the query of API requests and in the path of streams,
+// and logs get shared when asking for help.
+func (c *Config) accessLog(p gin.LogFormatterParams) string {
+	return fmt.Sprintf("[GIN] %s | %3d | %13v | %15s | %-7s %q\n%s",
+		p.TimeStamp.Format("2006/01/02 - 15:04:05"),
+		p.StatusCode,
+		p.Latency.Round(time.Microsecond),
+		p.ClientIP,
+		p.Method,
+		c.maskCredentials(p.Path),
+		p.ErrorMessage,
+	)
+}
+
+// Serve runs the proxy, and the HDHomeRun tuner when it has a port. It
+// returns when one of them stops.
+func (c *Config) Serve() error {
+	servers := []*http.Server{{Addr: c.listenAddress(), Handler: c.Handler(), ReadHeaderTimeout: 10 * time.Second}}
+	if c.HDHomeRunPort != 0 {
+		servers = append(servers, &http.Server{Addr: c.hdhomerunAddress(), Handler: c.HDHomeRunHandler(), ReadHeaderTimeout: 10 * time.Second})
+	}
+	stopped := make(chan error, len(servers))
+	for _, srv := range servers {
+		go func() { stopped <- srv.ListenAndServe() }()
+	}
+	return <-stopped
+}
+
+// listenAddress is the address the proxy listens on: every interface unless
+// one is given.
+func (c *Config) listenAddress() string {
+	return net.JoinHostPort(c.ListenAddress, strconv.Itoa(c.HostConfig.Port))
+}
+
+// servesM3U tells whether the proxy serves an M3U playlist of its own (M3U
+// mode).
+func (c *Config) servesM3U() bool {
+	return c.RemoteURL != nil && c.RemoteURL.String() != "" && !c.xtreamServesPlaylist()
+}
+
+// xtreamServesPlaylist tells whether the playlist address given to the proxy
+// is the get.php of its Xtream provider: the playlist is then one more Xtream
+// endpoint.
+func (c *Config) xtreamServesPlaylist() bool {
+	if c.XtreamBaseURL == "" || c.RemoteURL == nil || c.RemoteURL.Host == "" {
+		return false
+	}
+	return strings.Contains(c.XtreamBaseURL, c.RemoteURL.Host) &&
+		c.XtreamUser.String() == c.RemoteURL.Query().Get("username") &&
+		c.XtreamPassword.String() == c.RemoteURL.Query().Get("password")
+}
+
+// upstreamUserAgent is the User-Agent sent to the provider: the configured
+// one, else the client's, else a player's.
+func (c *Config) upstreamUserAgent(client string) string {
+	switch {
+	case c.UserAgent != "":
+		return c.UserAgent
+	case client != "":
+		return client
+	default:
+		return defaultUserAgent
+	}
+}
+
+// loadPlaylist reads a playlist from an http(s) address or a local file.
+func (c *Config) loadPlaylist(ctx context.Context, source, userAgent string) (*m3u.Playlist, error) {
+	if !strings.HasPrefix(source, "http://") && !strings.HasPrefix(source, "https://") {
+		f, err := os.Open(source)
+		if err != nil {
+			return nil, fmt.Errorf("unable to open playlist file: %w", err)
+		}
+		defer f.Close() // nolint: errcheck
+		return m3u.Parse(f)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+	if err != nil {
+		return nil, errors.New("invalid playlist address")
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := c.apiClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get the playlist: %w", withoutURL(err))
+	}
+	defer resp.Body.Close() // nolint: errcheck
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("unable to get the playlist: the provider answered %s", resp.Status)
+	}
+	return m3u.Parse(resp.Body)
+}
+
+// proxify returns the tracks of a playlist the proxy can serve, and the
+// playlist as clients get it: the same lines, each address replaced by the
+// proxy's, and nothing else naming the provider. A track the filters leave
+// out, or with an unusable address, is dropped from both.
+func (c *Config) proxify(playlist *m3u.Playlist, fromXtream bool, u *proxyUser) (*m3u.Playlist, []byte) {
+	kept := &m3u.Playlist{Header: playlist.Header, Tracks: make([]m3u.Track, 0, len(playlist.Tracks))}
+	out := &m3u.Playlist{Header: c.hideProvider(playlist.Header, fromXtream, u), Tracks: make([]m3u.Track, 0, len(playlist.Tracks))}
+	if !fromXtream {
+		out.Header = c.m3uHeader(playlist.Header, out.Header, u)
+	}
+
+	for _, track := range playlist.Tracks {
+		if u.rules.Active() && !keepTrack(track, u.rules) {
+			continue
+		}
+		uri, err := c.replaceURL(track.URI, fromXtream, u)
+		if err != nil {
+			log.Printf("[iptv-proxy] ERROR: track %q dropped: invalid address", track.Name())
+			continue
+		}
+		kept.Tracks = append(kept.Tracks, track)
+		proxied := c.hideProviderInTrack(track, fromXtream, u)
+		proxied.URI = uri
+		out.Tracks = append(out.Tracks, proxied)
+	}
+
+	var buf bytes.Buffer
+	_, _ = out.WriteTo(&buf) // a bytes.Buffer does not fail
+	return kept, buf.Bytes()
+}
+
+// proxyBaseURL is the address clients reach the proxy at.
+func (c *Config) proxyBaseURL() string {
+	protocol := "http"
+	if c.HTTPS {
+		protocol = "https"
+	}
+
+	customEnd := strings.Trim(c.CustomEndpoint, "/")
+	if customEnd != "" {
+		customEnd = "/" + customEnd
+	}
+
+	return fmt.Sprintf("%s://%s:%d%s", protocol, c.HostConfig.Hostname, c.AdvertisedPort, customEnd)
+}
+
+func (c *Config) providerAccount() xtream.Account {
+	return xtream.Account{BaseURL: c.XtreamBaseURL, User: c.XtreamUser.String(), Password: c.XtreamPassword.String()}
+}
+
+// hiddenAccounts are the accounts clients must not learn: the proxy's
+// (see hiddenAccount), and those of its other sources.
+func (c *Config) hiddenAccounts() []xtream.Account {
+	hidden := []xtream.Account{c.hiddenAccount()}
+	for _, src := range c.sources[min(1, len(c.sources)):] {
+		hidden = append(hidden, src.account)
+	}
+	return hidden
+}
+
+// leaks tells whether text gives one of the hidden accounts away.
+func (c *Config) leaks(text string) bool {
+	for _, hidden := range c.hiddenAccounts() {
+		if xtream.Leaks(text, hidden) {
+			return true
+		}
+	}
+	return false
+}
+
+// hiddenAccount is what clients must not learn from the provider's answers:
+// the proxy's account. In passthrough mode a client knows its own account,
+// and what it must not learn is where the provider is: its host takes the
+// place of a password.
+func (c *Config) hiddenAccount() xtream.Account {
+	if c.XtreamPassthrough {
+		provider, err := url.Parse(c.XtreamBaseURL)
+		if err != nil || provider.Hostname() == "" {
+			return xtream.Account{}
+		}
+		return xtream.Account{Password: provider.Hostname()}
+	}
+	return c.providerAccount()
+}
+
+// replaceURL returns the proxy's address of a track: the same path with the
+// proxy's credentials for an Xtream stream, else
+// "<custom-id>/<user>/<password>/<track key>/<file name>".
+func (c *Config) replaceURL(uri string, xtream bool, u *proxyUser) (string, error) {
+	oriURL, err := url.Parse(uri)
+	if err != nil {
+		return "", err
+	}
+
+	uriPath := oriURL.EscapedPath()
+	if xtream {
+		uriPath = strings.Replace(
+			uriPath,
+			"/"+c.XtreamUser.PathEscape()+"/"+c.XtreamPassword.PathEscape()+"/",
+			"/"+u.name.PathEscape()+"/"+u.password.PathEscape()+"/",
+			1,
+		)
+	} else {
+		uriPath = path.Join("/", c.endpointAntiColision, u.name.PathEscape(), u.password.PathEscape(), trackKey(uri), path.Base(uriPath))
+	}
+
+	base, err := url.Parse(c.proxyBaseURL())
+	if err != nil {
+		return "", err
+	}
+	base.User = oriURL.User
+
+	newURL, err := url.Parse(base.String() + uriPath)
+	if err != nil {
+		return "", err
+	}
+
+	return newURL.String(), nil
+}
+
+// withoutURL drops the address from an http client error: it holds the
+// provider's credentials, and errors end up in logs.
+func withoutURL(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
+}
